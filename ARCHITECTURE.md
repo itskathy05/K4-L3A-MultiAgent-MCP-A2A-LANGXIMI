@@ -1,174 +1,82 @@
-# L3A Architecture Record — Team LANGXIMI
+# L3A — Tài liệu kiến trúc
 
-Tài liệu thiết kế kiến trúc hệ thống Multi-Agent điều tra khiếu nại thương mại điện tử (K4-L3A Multi-Agent MCP + A2A).
+Tài liệu này mô tả triển khai hiện tại trong `src/student_agent/`. Đầu vào là case L3A; đầu ra là JSON theo contract L3A v2 cùng trace sự kiện. Tài liệu không chứa API key hoặc suy luận nội bộ của agent.
 
-## 1. System overview
+## 1. Luồng xử lý
 
-Quy trình xử lý tuần tự từ case input đến các specialist agent, MCP Gateway, Verifier và tạo ra Output + Trace:
+`day09 run` đọc `case-set.json` và từng `inputs/<case_id>.json`, mở một phiên MCP và xử lý các case tuần tự. Với mỗi case, CLI ghi `case_received`, gọi `solve_case`, kiểm tra output, ghi `outputs/<case_id>.json`, rồi ghi `case_finalized`. Trace của lượt chạy nằm tại `traces/trace.jsonl`.
 
 ```text
-[inputs/<case_id>.json]
-         │
-         ▼
- ┌───────────────┐  task_assigned   ┌───────────────────────┐
- │  Coordinator  ├─────────────────►│   order_specialist    │──┐
- └───────┬───────┘                  └───────────┬───────────┘  │
-         │                                      │ call/consume │
-         │                          ┌───────────▼───────────┐  │
-         │                          │  MCP Evidence Gateway │  │
-         │                          └───────────┬───────────┘  │
-         │                                      │              │
-         │                          ┌───────────▼───────────┐  │
-         │  handoff                 │   payment_specialist  │◄─┘
-         │                          └───────────┬───────────┘
-         │                                      │ handoff
-         │                          ┌───────────▼───────────┐
-         │                          │  shipment_specialist  │
-         │                          └───────────┬───────────┘
-         │                                      │ handoff
-         │                          ┌───────────▼───────────┐
-         │                          │   policy_specialist   │
-         │                          └───────────┬───────────┘
-         │                                      │ policy_decided + handoff
-         │                                      ▼
-         │                          ┌───────────────────────┐
-         │◄─────────────────────────┤       verifier        │
-         ▼   verification_completed └───────────────────────┘
-[outputs/<case_id>.json] & [traces/trace.jsonl]
+Input → Coordinator → Order/Item, Payment, Shipment, Policy
+                         ↓                ↓
+                    MCP Gateway → EvidenceLedger
+                                      ↓
+                              Facts → Decision → Verifier → Output
+                                      └──────── TraceWriter ────────┘
 ```
 
-`solve_case()` (`src/student_agent/workflow.py`) implements the coordinator. It fetches
-evidence through specialist calls, derives the `primary_issue` from that evidence with a
-deterministic classifier (`_classify`), asks `get_policy` for the authoritative
-`case_status` / `recommended_action` for that issue, then assembles and hands off the
-output for verification before returning it.
+Coordinator phát hiện tool MCP, tạo `EvidenceLedger` riêng cho case và giao việc dựa trên topic của claim cùng dữ kiện đã lấy được. `facts.py` chuẩn hóa dữ liệu; `decision.py` chọn issue, action và số tiền; verifier kiểm tra kết quả trước khi CLI ghi file. Các agent là vai trò Python trong cùng tiến trình; không dùng LLM hay dịch vụ A2A bên ngoài.
 
-The customer's own claimed topic (`customer_request.claims[].topic`) is never used as an
-input to the classifier — it is only compared against the derived `primary_issue`
-afterwards to score each `claim_assessments[].verdict`.
+## 2. Vai trò và quyền truy vấn
 
-## 2. Agent ownership
+| Vai trò | Trách nhiệm | Tool được phép gọi |
+| --- | --- | --- |
+| Coordinator | Phát hiện tool, điều phối, kiểm tra handoff | Không gọi tool lấy evidence |
+| Order/Item | Xác minh đơn, mặt hàng và seller khi cần | `get_order`, `get_order_items`, `get_sellers`, `get_product_context` |
+| Payment | Xác minh thanh toán và hoàn tiền | `get_order_payments`, `get_payment_timeline`, `get_refund_timeline` |
+| Shipment | Xác minh giao hàng và bàn giao | `get_shipment_summary` |
+| Policy | Lấy policy theo `policy_version` | `get_policy` |
+| Verifier | Kiểm tra output và evidence refs | Không gọi MCP |
 
-| Actor | Input | Trách nhiệm | Output/handoff |
-| --- | --- | --- | --- |
-| Coordinator | `case`, `claimed_order_id` | Dispatches specialists in order, aggregates evidence, builds the final output object | Hands off to verifier |
-| Order-agent | `case_id`, `order_id` | `get_order`, `get_order_items`; dedupes repeated `order_item_id` records | Order status/timestamps, item price/freight/seller |
-| Payment-agent | `case_id`, `order_id` | `get_payment_timeline`, `get_refund_timeline` (best-effort) | Captured/mismatch events, refund lifecycle |
-| Shipment-agent | `case_id`, `order_id` | `get_shipment_summary` | Delivery timestamps, `delivered_late` events |
-| Policy-agent | `case_id`, `policy_version`, derived `primary_issue` | `get_policy`; looks up the authoritative `case_status` / `recommended_action` / `party_type` for that issue | Resolution template for the verifier |
-| Verifier | Assembled output | Confirms evidence refs came from successful calls only, emits `verification_completed` | Final output returned to `cli.py` |
+`get_product_context` được cấp quyền nhưng luồng hiện tại không gọi. Gateway có thể phát hiện `get_customer_history`, nhưng không có specialist nào được cấp quyền gọi. `get_order` và `get_order_payments` phải có trong tool discovery; thiếu một trong hai thì dừng.
 
-No agent calls `get_sellers`, `get_product_context`, or `get_customer_history` — seller id
-is already present on each item row, and the other two domains are not required by any of
-the 10 `primary_issue` categories, so pulling them would only add unused (and
-potentially forbidden-domain-penalized) evidence.
+- Claim về thanh toán hoặc trạng thái đơn `unavailable` dẫn tới truy vấn item; claim về thanh toán dẫn tới truy vấn payment timeline.
+- Claim về giao chậm dẫn tới truy vấn shipment; claim về refund dẫn tới truy vấn refund timeline.
+- Khi dữ kiện cho thấy issue có thể cần xử lý, coordinator truy vấn policy và refund timeline nếu chưa có. Với issue liên quan seller mà chưa có seller ID, coordinator truy vấn seller.
 
-## 3. A2A protocol
+## 3. Handoff và trace
 
-Every message is implicit function-call handoff within one `asyncio` task, correlated by
-`case_id` (passed to every MCP call and every trace event). There is no cross-case or
-cross-agent shared state — each `solve_case()` call is independent, so there is no
-possibility of a coordination loop. Handoff points are traced explicitly:
+`Handoff` nội bộ gồm `case_id`, sender, recipient, intent, evidence refs, findings và status. Coordinator ghi `task_assigned`; specialist ghi `tool_result_consumed` khi dùng evidence và `handoff` sau khi hoàn tất. Policy agent còn ghi `policy_decided`; verifier ghi `verification_completed` khi kiểm tra thành công. Trace chỉ ghi sự kiện, mã quyết định, tên tool và evidence refs; findings không được ghi nguyên văn vào trace.
 
-- `task_assigned` (coordinator → order/payment/shipment/policy-agent) before each
-  specialist's calls.
-- `tool_result_consumed` immediately after each successful MCP call, citing the
-  `evidence_ref` that call returned.
-- `policy_decided` once the classifier has produced a `primary_issue`.
-- `handoff` (coordinator → verifier) once the output object is assembled.
-- `verification_completed` after the verifier's checks.
+Các task chạy tuần tự, mỗi task tối đa 180 giây. Một MCP call tối đa 45 giây; lỗi tạm thời đủ điều kiện được thử thêm một lần sau 0,25 giây. Không có vòng lặp giao việc hay giao việc đệ quy. Coordinator kiểm tra `case_id` của mọi handoff và bảo đảm các ref trong handoff thuộc ledger của case đó.
 
-Timeouts are delegated to `httpx2`'s client timeout (300s) configured in
-`mcp_gateway.connect_gateway`. Transient transport/gateway errors (`MCPError`,
-`httpx2.HTTPError`) are retried at most 3 times with linear backoff inside
-`EvidenceGateway.call`; tool-level errors are never retried, so no unbounded loop exists.
+## 4. Vòng đời evidence
 
-## 4. Evidence lifecycle
+Gateway chỉ gọi tool đã phát hiện và luôn gửi `case_id`. MCP response được kiểm tra theo schema public. Ledger kiểm tra thêm `domain` mong đợi của tool, lưu `evidence_ref`, `result_hash`, tham số truy vấn, dữ liệu và warnings. Truy vấn trùng trong cùng case dùng lại record; cache không chia sẻ giữa các case.
 
-`EvidenceGateway.call()` validates every MCP response against
-`mcp-evidence-response-v1.schema.json` before returning it, so a malformed envelope never
-reaches the workflow. `workflow._fetch()` wraps each call, catches only `RuntimeError`
-(a tool-level failure such as "not found"), and returns `None` instead of inventing data —
-`get_refund_timeline` routinely returns "not found" for orders with no refund history, and
-that is treated as "no refund lifecycle exists" rather than an error.
+Khi specialist tiêu thụ record, ledger xác nhận record thuộc case hiện tại và phát một sự kiện `tool_result_consumed` cho ref đó. Output chỉ trích dẫn ref đã tiêu thụ trong case; mỗi ref của claim phải có trong danh sách ref cấp cao của output. Nội dung khách hàng khai báo chỉ dùng để chọn hướng điều tra, không được coi là bằng chứng.
 
-Every evidence ref actually consumed is collected into `output.evidence_refs`; the same
-list is reused for every `claim_assessments[].evidence_refs`, since all fetched domains
-were used to reach the one classification decision for the case. No evidence_ref is ever
-constructed by hand — every ref in the output was returned by a real `gateway.call()`.
+## 5. Xử lý lỗi và thiếu dữ liệu
 
-## 5. Failure policy
+| Tình huống | Cách xử lý hiện tại |
+| --- | --- |
+| Timeout, lỗi kết nối/transport, `MCPError` hoặc lỗi thực thi tool dạng chung | Thử lại tối đa một lần; hết lượt thì ghi lỗi nguồn trong ledger |
+| Tool tùy chọn chưa được phát hiện hoặc response sai schema/domain | Ghi lỗi nguồn, không tự tạo evidence |
+| Hết 180 giây cho một task | Tạo handoff với status `TASK_TIMEOUT` và không có refs |
+| Không lấy được bất kỳ evidence nào | Dừng case bằng lỗi; không tạo output thiếu căn cứ |
+| Thiếu nguồn cần cho claim hoặc issue | Có thể chọn `insufficient_evidence` và `needs_investigation`; không suy ra khoản hoàn tiền khi thiếu policy hoặc refund timeline |
+| MCP trả order ID khác ID được claim | Dừng case bằng lỗi |
+| Output không qua verifier hoặc schema | Dừng case trước khi ghi file output và `case_finalized` |
 
-| Failure | Retry? | Fallback | Trace event/code |
-| --- | --- | --- | --- |
-| MCP timeout / tool error | Transport errors: up to 3 attempts; tool errors: no | Treated as "evidence absent"; `get_order`/`get_order_items` failing aborts the case as `insufficient_evidence`, other domains are optional and degrade the classifier's inputs | `verification_completed` with `decision_code=insufficient_evidence` |
-| Not found (e.g. no refund history) | No | Treated as "lifecycle event never occurred" (`refund_timeline=None`), not as missing/invalid data | n/a (no event emitted for a domain never fetched) |
-| Source conflict (order-level facts vs. a shipment/payment event) | No | The order-level, purchase-timestamp-anchored fact wins; the disagreeing event is recorded, never silently dropped | `data_conflicts[]` entry with `resolution_code` |
-| Invalid specialist result (schema violation) | No | `Contracts.validate_evidence` raises `ContractError` before the workflow sees the data — this is a real bug, not a case outcome, so it is not caught | n/a — propagates and fails the run |
+Payment và item có tổng khác nhau được đưa vào `data_conflicts` với mã `PAYMENT_TOTAL_DIFFERS_FROM_ITEM_TOTAL`. Nếu một case lỗi, `day09 run` dừng; CLI không tự bỏ qua để chạy tiếp.
 
-Tool-level errors are not retried because every MCP call is a single, idempotent read; a second
-identical call would return the same evidence (or the same "not found"), so retrying
-cannot change the outcome and is not attempted. Missing evidence always results in a lower
-`confidence` and/or `primary_issue = insufficient_evidence`, never a fabricated value.
+## 6. Quyết định và kiểm tra đầu ra
 
-## 6. Verification invariants
+`facts.py` rút trích trạng thái đơn, item, seller, thanh toán, refund và mốc giao hàng từ evidence. `decision.py` dùng quy tắc cố định để xác định issue được hỗ trợ, ưu tiên topic khách hàng nêu nếu có chứng cứ, rồi chọn `case_status`, confidence, bên chịu trách nhiệm và action. Refund mới chỉ được đề xuất khi có payment, policy và refund timeline; số tiền đã hoàn thành được trừ khỏi khoản còn lại. Tiền được tính bằng `Decimal` theo cent BRL trước khi đưa vào JSON.
 
-`_verify()` runs on the assembled output before `solve_case()` returns (and
-`contracts.validate_output` re-checks schema in `cli.py`). It returns a list of problem
-codes; a non-empty list downgrades the whole output to `primary_issue =
-insufficient_evidence`, `case_status = needs_investigation`, `confidence = 0.3`
-(evidence_refs/root_cause/financial_resolution/resolution_actions/claim_assessments are
-rebuilt to match), and `verification_completed` is traced with
-`decision_code = "failed"` and `attributes.problems = <count>` (`"passed"` / `0` when
-clean). Checks:
+Verifier kiểm tra schema L3A v2, `case_id`, danh sách ref duy nhất, ref đã được tiêu thụ trong case, liên kết ref của claim, ID của tối đa 5 claim được đánh giá, tổng các dòng hoàn tiền và tính duy nhất của entity ID. Với `no_action`, output không được có refund hoặc action. CLI kiểm tra lại schema và `case_id` trước khi ghi file. Các kiểm tra này xác nhận cấu trúc và liên kết cơ bản; scorer vẫn đánh giá tính đúng đắn nghiệp vụ.
 
-- **Schema**: `contracts.validate_output()` validates the full object against
-  `l3a-output-v2.schema.json` before it is written to `outputs/<case_id>.json`.
-- **Entity scope**: `affected_entities` is built only from the fetched order/items for
-  this `case_id`/`order_id` — never from another case's evidence.
-- **Evidence ownership**: `_verify` checks every `evidence_refs` entry (and every
-  `claim_assessments[].evidence_refs` entry) is a subset of the refs actually returned
-  by a `gateway.call()` made for this case_id in this run; none are copied from a prior
-  case or invented. `evidence_refs` itself is further narrowed to only the tools listed
-  for the case's `primary_issue` in `ISSUE_TOOLS` (`workflow.py`), instead of citing
-  every fetched domain, for evidence precision.
-- **Claim linkage**: every `claim_assessments[].verdict` is derived by comparing the
-  claim's topic against the independently-derived `primary_issue`, not by trusting the
-  claim.
-- **Money/action consistency**: `_verify` checks `case_status == "no_action"` implies
-  `recommended_refund_brl == 0` and empty `refund_lines`, and `case_status ==
-  "action_required"` implies `recommended_refund_brl > 0`; `case_status` and
-  `recommended_action` both come from the same `get_policy` rule lookup, so they cannot
-  disagree.
-- **Responsible party**: `_verify` checks `party_type == "seller"` always carries a
-  non-null `party_id`; `party_id` itself is set from the classifier's `seller_id` only
-  when `get_policy`'s rule for this issue names `party_type == "seller"` (not from a
-  per-branch heuristic), so it cannot disagree with the policy-authoritative party type.
-- **Lifecycle scoping**: every case's evidence mixes the real order lifecycle with a
-  decoy block of records shifted days/months away. `_classify()` keeps only payment
-  events on the purchase day (±1 day, byte-identical replicas collapsed), refund and
-  shipment events inside purchase..max(delivery, estimate)+2 days, and refunds whose
-  amount matches a real capture; every exclusion is recorded in `data_conflicts`.
-  Branch order: mismatch → canceled/unavailable → late → refund failed/pending →
-  duplicate capture → reconciled split/unsupported → insufficient.
-- **Confidence bounds**: every branch of `_classify()` returns a fixed confidence in
-  `[0.5, 0.95]` depending on signal strength (mismatch/order_status/refund failed/
-  duplicate capture score 0.95; late delivery 0.9 with a matching shipment event, 0.65
-  when actor-inferred; refund pending/split/unsupported 0.9; `insufficient_evidence` is
-  fixed at 0.5, or 0.3 when `_verify` itself triggers the downgrade).
+## 7. Chạy lại và đóng gói
 
-## 7. Reproducibility
+Yêu cầu Python 3.11 trở lên; dependency và khoảng phiên bản nằm trong `pyproject.toml`. Không có model, seed ngẫu nhiên hoặc cấu hình sampling. Các case và specialist chạy tuần tự qua một phiên MCP; kết quả còn phụ thuộc dữ liệu gateway trả về lúc chạy. Endpoint và Team API Key được đọc từ `.env`, không đưa vào tài liệu hoặc artifact.
 
-- Model/config: this workflow is a deterministic rule engine — no LLM call is made
-  inside `solve_case()`, so there is no model/temperature to pin.
-- Dependencies: pinned via `pyproject.toml` (`httpx2`, `jsonschema[format]`, `mcp`,
-  `python-dotenv`); exact versions are whatever `pip install -e ".[dev]"` resolved at
-  install time, recorded in the environment's lock/freeze if one is taken.
-- Concurrency: `cli.py _run()` processes cases sequentially (`for case_id in
-  case_set.case_ids`), one MCP session shared across the whole run — no concurrency
-  limit is needed because there is no parallelism.
-- Random seed: none used — every decision is a pure function of the fetched evidence.
-- Run command: `python -m student_agent.cli run`, followed by
-  `python -m student_agent.cli validate` and
-  `python -m student_agent.cli package --output dist/submission.zip`.
-- Resource limits: bounded by the MCP Evidence Gateway's own per-call timeout (300s, configured in `mcp_gateway.connect_gateway`); no local resource limits are configured.
+```bash
+pytest -q
+day09 validate-inputs
+day09 mcp-tools
+day09 run
+day09 validate
+day09 package --output dist/submission.zip
+```
+
+`day09 run` xóa output JSON và trace cũ trước lượt chạy. `day09 validate` yêu cầu đủ output cho toàn bộ case set và trace hợp lệ. ZIP nộp bài chỉ chứa `manifest.json`, `trace.jsonl` và `outputs/<case_id>.json`; `ARCHITECTURE.md` được duy trì trong repo, không nằm trong ZIP.
